@@ -1,0 +1,3 @@
+(function() {var implementors = {
+"pump_v2_amm":[["impl AccountDeserialize for <a class=\"struct\" href=\"pump_v2_amm/state/struct.Amm.html\" title=\"struct pump_v2_amm::state::Amm\">Amm</a>"],["impl AccountDeserialize for <a class=\"struct\" href=\"pump_v2_amm/state/struct.GlobalParameters.html\" title=\"struct pump_v2_amm::state::GlobalParameters\">GlobalParameters</a>"]]
+};if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

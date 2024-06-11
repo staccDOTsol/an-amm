@@ -1,0 +1,1 @@
+window.ALL_CRATES = ["cfg_if","either","libc","num_traits","once_cell","ppv_lite86","pump_v2_amm","subtle","typenum","unicode_ident"];

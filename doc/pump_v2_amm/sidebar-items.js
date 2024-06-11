@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["check_id","entry","entrypoint","id"],"mod":["accounts","error","fixtures","instruction","instructions","program","solana_amm","state","utils"],"static":["ID"]};

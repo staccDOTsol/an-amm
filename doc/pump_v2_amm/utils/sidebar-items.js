@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["spl_token_transfer"],"struct":["TokenTransferParams"]};

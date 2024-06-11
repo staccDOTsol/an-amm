@@ -1,0 +1,507 @@
+use crate::error::ErrorCode;
+use crate::utils::{spl_token_transfer, TokenTransferParams};
+use crate::Amm;
+use anchor_lang::prelude::*;
+
+// SellEvent event
+#[event]
+pub struct SellEvent {
+    pub base_amount: u64,
+    pub quote_amount: u64,
+    pub timestamp: u64,
+    pub user: Pubkey,
+    pub protocol_fee_amount: u64,
+    pub referrer: Option<Pubkey>,
+    pub referrer_fee_amount: Option<u64>,
+}
+/// Calculates the amount of base tokens received for selling a given amount of quote tokens using the xyk invariant without any fees.
+///
+/// # Arguments
+/// * `base_amount` - The amount of base tokens being sold by the user.
+/// * `amm` - The AMM account containing the reserves for the base and quote tokens.
+///
+/// # Returns
+/// * `Result<u64>` - The amount of base tokens received for the given quote amount.
+fn sell_quote(base_amount: u64, amm: &Amm) -> Result<u64> {
+    let quote_amount = (base_amount * amm.quote_reserve) / (amm.base_reserve + base_amount);
+    Ok(quote_amount)
+}
+
+/// This Sell module is responsible for handling the selling of tokens from the AMM.
+/// It includes the logic for calculating the required quote amount, transferring tokens,
+/// and emitting events.
+pub mod sell {
+    use super::*;
+    use crate::Sell;
+
+    /// Executes a sell transaction where a user sells base tokens for quote tokens.
+    ///
+    /// # Parameters:
+    /// * `ctx` - The context in which this handler is executed, containing all necessary accounts.
+    /// * `base_amount` - The amount of the base token being sold by the user.
+    /// * `min_quote_amount` - The minimum amount of quote tokens the user expects to receive.
+    ///
+    /// # Returns:
+    /// * `Result<()>` - Returns `Ok(())` if the transaction is successful.
+    pub fn handler<'a>(
+        ctx: Context<'_, '_, '_, 'a, Sell<'a>>,
+        base_amount: u64,
+        min_quote_amount: u64,
+    ) -> Result<()> {
+        let base_token_program = ctx.accounts.base_token_program.to_account_info();
+        let quote_token_program = ctx.accounts.quote_token_program.to_account_info();
+
+        // Calculate the required quote amount using AMM reserves
+        let quote_amount = sell_quote(base_amount, &*ctx.accounts.amm)?;
+        require_gte!(
+            quote_amount,
+            min_quote_amount,
+            ErrorCode::InsufficientQuoteAmount
+        );
+
+        // Update AMM reserves
+        let amm = &mut ctx.accounts.amm;
+        amm.base_reserve += base_amount;
+        amm.quote_reserve -= quote_amount;
+
+        // Transfer base amount from user to base reserve
+        spl_token_transfer(TokenTransferParams {
+            source: ctx.accounts.user_base_ata.to_account_info(),
+            destination: ctx.accounts.base_reserve_ata.to_account_info(),
+            amount: base_amount,
+            authority: ctx.accounts.user.to_account_info(),
+            authority_signer_seeds: &[],
+            decimals: ctx.accounts.base_mint.decimals,
+            mint: ctx.accounts.base_mint.to_account_info(),
+            token_program: base_token_program.clone(),
+        })?;
+
+        let signer_seeds = [
+            b"amm",
+            ctx.accounts.amm.creator.as_ref(),
+            ctx.accounts.base_mint.to_account_info().key.as_ref(),
+            ctx.accounts.quote_mint.to_account_info().key.as_ref(),
+            &[ctx.bumps.amm],
+        ];
+
+        // Transfer quote amount from quote reserve to user
+        spl_token_transfer(TokenTransferParams {
+            source: ctx.accounts.quote_reserve_ata.to_account_info(),
+            destination: ctx.accounts.user_quote_ata.to_account_info(),
+            amount: quote_amount,
+            authority: ctx.accounts.amm.to_account_info(),
+            authority_signer_seeds: &signer_seeds,
+            decimals: ctx.accounts.quote_mint.decimals,
+            mint: ctx.accounts.quote_mint.to_account_info(),
+            token_program: quote_token_program.clone(),
+        })?;
+
+        let mut protocol_fee_bps = ctx.accounts.global_parameters.protocol_fee_bps;
+        let mut referrer_fee_amount = None;
+
+        // Transfer the fee to refferer if set and apply protocol fee discount.
+        if ctx.remaining_accounts.len() > 0 {
+            protocol_fee_bps -= ctx.accounts.global_parameters.referrer_fee_discount_bps;
+            let referrer_fee_bps = ctx.accounts.global_parameters.referrer_fee_bps;
+            referrer_fee_amount = Some((quote_amount * referrer_fee_bps) / 10000);
+
+            spl_token_transfer(TokenTransferParams {
+                source: ctx.accounts.user_quote_ata.to_account_info(),
+                // This account is checked in one of the token program instructions
+                destination: ctx.remaining_accounts.get(0).unwrap().to_account_info(),
+                amount: referrer_fee_amount.unwrap(),
+                authority: ctx.accounts.user.to_account_info(),
+                authority_signer_seeds: &[],
+                decimals: ctx.accounts.quote_mint.decimals,
+                mint: ctx.accounts.quote_mint.to_account_info(),
+                token_program: quote_token_program.clone(),
+            })?;
+        }
+
+        // Transfer the protocol fee to the fee receiver
+        let protocol_fee_amount = (quote_amount * protocol_fee_bps) / 10000;
+        spl_token_transfer(TokenTransferParams {
+            source: ctx.accounts.user_quote_ata.to_account_info(),
+            destination: ctx.accounts.fee_receiver_ata.to_account_info(),
+            amount: protocol_fee_amount,
+            authority: ctx.accounts.user.to_account_info(),
+            authority_signer_seeds: &[],
+            decimals: ctx.accounts.quote_mint.decimals,
+            mint: ctx.accounts.quote_mint.to_account_info(),
+            token_program: quote_token_program.clone(),
+        })?;
+
+        // Emit the event
+        emit_cpi!(SellEvent {
+            base_amount,
+            quote_amount,
+            timestamp: Clock::get()?.unix_timestamp as u64,
+            referrer: ctx
+                .remaining_accounts
+                .get(0)
+                .map(|r| *r.to_account_info().key),
+            referrer_fee_amount,
+            protocol_fee_amount,
+            user: *ctx.accounts.user.to_account_info().key,
+        });
+
+        emit!(SellEvent {
+            base_amount,
+            quote_amount,
+            timestamp: Clock::get()?.unix_timestamp as u64,
+            referrer: ctx
+                .remaining_accounts
+                .get(0)
+                .map(|r| *r.to_account_info().key),
+            referrer_fee_amount,
+            protocol_fee_amount,
+            user: *ctx.accounts.user.to_account_info().key,
+        });
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::fixtures::tests::fetch_reserves;
+    use crate::fixtures::tests::setup_amm;
+    use crate::fixtures::tests::setup_mints_and_accounts;
+    use crate::fixtures::tests::setup_test_environment;
+    use crate::fixtures::tests::setup_user_accounts;
+    use solana_client::nonblocking::rpc_client::RpcClient;
+    use solana_sdk::{
+        signature::{Keypair, Signer},
+        transaction::Transaction,
+    };
+    use solana_transaction_status::option_serializer::OptionSerializer;
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use switchboard_solana::Pubkey;
+
+    fn sell_instruction(
+        program_id: &solana_sdk::pubkey::Pubkey,
+        global_parameters: &solana_sdk::pubkey::Pubkey,
+        amm_pubkey: &solana_sdk::pubkey::Pubkey,
+        base_pubkey: &solana_sdk::pubkey::Pubkey,
+        quote_pubkey: &solana_sdk::pubkey::Pubkey,
+        payer_pubkey: &solana_sdk::pubkey::Pubkey,
+        base_amount: u64,
+        min_quote_amount: u64,
+    ) -> solana_sdk::instruction::Instruction {
+        let mut data = switchboard_solana::get_ixn_discriminator("sell").to_vec();
+        data.extend_from_slice(&base_amount.to_le_bytes());
+        data.extend_from_slice(&min_quote_amount.to_le_bytes());
+
+        // Construct the accounts required for the add_liquidity_instruction
+        let accounts = vec![
+            solana_sdk::instruction::AccountMeta::new(*amm_pubkey, false),
+            solana_sdk::instruction::AccountMeta::new(*global_parameters, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(*payer_pubkey, true),
+            solana_sdk::instruction::AccountMeta::new(
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &payer_pubkey,
+                    &base_pubkey,
+                    &spl_token_2022::ID,
+                ),
+                false,
+            ),
+            solana_sdk::instruction::AccountMeta::new(
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &payer_pubkey,
+                    &quote_pubkey,
+                    &spl_token::ID,
+                ),
+                false,
+            ),
+            solana_sdk::instruction::AccountMeta::new(
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &amm_pubkey,
+                    &base_pubkey,
+                    &spl_token_2022::ID,
+                ),
+                false,
+            ),
+            solana_sdk::instruction::AccountMeta::new(
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &amm_pubkey,
+                    &quote_pubkey,
+                    &spl_token::ID,
+                ),
+                false,
+            ),
+            solana_sdk::instruction::AccountMeta::new(
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &payer_pubkey,
+                    &quote_pubkey,
+                    &spl_token::ID,
+                ),
+                false,
+            ),
+            solana_sdk::instruction::AccountMeta::new(*base_pubkey, false),
+            solana_sdk::instruction::AccountMeta::new(*quote_pubkey, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(spl_token_2022::ID, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(spl_token::ID, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(
+                Pubkey::from_str("38C9cb9ak6zRdtA3ZxKPp9sYAPEKT9KfZcUcdC5Tda69").unwrap(),
+                false,
+            ),
+            solana_sdk::instruction::AccountMeta::new_readonly(*program_id, false),
+            solana_sdk::instruction::AccountMeta::new(
+                spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &payer_pubkey,
+                    &quote_pubkey,
+                    &spl_token::ID,
+                ),
+                false,
+            ),
+        ];
+        // Create the instruction using the program_id, accounts, and data
+        solana_sdk::instruction::Instruction {
+            program_id: *program_id,
+            accounts,
+            data,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sell_success() {
+        let setup = setup_test_environment(true).await;
+        let base_amount = 100_000;
+        let min_quote_amount = 1_000;
+
+        let ix = sell_instruction(
+            &setup.program_id,
+            &setup.global_parameters,
+            &setup.amm_account,
+            &setup.base_mint,
+            &setup.quote_mint,
+            &setup.keypair.pubkey(),
+            base_amount,
+            min_quote_amount,
+        );
+
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&setup.keypair.pubkey()));
+        tx.sign(
+            &[&setup.keypair],
+            setup.client.get_latest_blockhash().await.unwrap(),
+        );
+        let result = setup.client.send_and_confirm_transaction(&tx).await;
+        assert!(result.is_ok(), "Sell transaction should succeed");
+    }
+    #[tokio::test]
+    async fn test_events_on_sell_success() {
+        let setup = setup_test_environment(true).await;
+        let base_amount = 100_000;
+        let min_quote_amount = 100_000;
+        let ix = sell_instruction(
+            &setup.program_id,
+            &setup.global_parameters,
+            &setup.amm_account,
+            &setup.base_mint,
+            &setup.quote_mint,
+            &setup.keypair.pubkey(),
+            base_amount,
+            min_quote_amount,
+        );
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&setup.keypair.pubkey()));
+        tx.sign(
+            &[&setup.keypair],
+            setup.client.get_latest_blockhash().await.unwrap(),
+        );
+        let result = setup.client.send_and_confirm_transaction(&tx).await;
+
+        // Get the transaction details
+        let tx = setup
+            .client
+            .get_transaction(
+                &result.unwrap(),
+                solana_transaction_status::UiTransactionEncoding::JsonParsed,
+            )
+            .await;
+
+        // Test the emitted events
+        if let OptionSerializer::Some(logs) = tx.unwrap().transaction.meta.unwrap().log_messages {
+            for log in logs {
+                if log.starts_with("Program emit_cpi SellEvent") {
+                    let event_data: Vec<&str> = log.split_whitespace().collect();
+                    assert_eq!(event_data[3], "base_amount:");
+                    assert_eq!(event_data[4], base_amount.to_string());
+                    // Add more assertions for other event fields as needed
+                } else if log.starts_with("Program emit SellEvent") {
+                    let event_data: Vec<&str> = log.split_whitespace().collect();
+                    assert_eq!(event_data[3], "base_amount:");
+                    assert_eq!(event_data[4], base_amount.to_string());
+                    // Add more assertions for other event fields as needed
+                }
+            }
+        } else {
+            panic!("No log messages found in the transaction metadata");
+        }
+    }
+    #[tokio::test]
+    async fn test_sell_failure_insufficient_quote() {
+        let setup = setup_test_environment(true).await;
+        let base_amount = 100_000;
+        let min_quote_amount = 1_000_000; // Deliberately high to trigger failure
+
+        let ix = sell_instruction(
+            &setup.program_id,
+            &setup.global_parameters,
+            &setup.amm_account,
+            &setup.base_mint,
+            &setup.quote_mint,
+            &setup.keypair.pubkey(),
+            base_amount,
+            min_quote_amount,
+        );
+
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&setup.keypair.pubkey()));
+        tx.sign(
+            &[&setup.keypair],
+            setup.client.get_latest_blockhash().await.unwrap(),
+        );
+        let result = setup.client.send_and_confirm_transaction(&tx).await;
+        assert!(
+            result.is_err(),
+            "Transaction should fail due to insufficient quote amount"
+        );
+    }
+    #[tokio::test]
+    async fn test_sell_updates_base_reserve_correctly() {
+        let setup = setup_test_environment(true).await;
+        let base_amount = 100_000;
+        let min_quote_amount = 1000;
+
+        let initial_base_reserve = fetch_reserves(&setup).await.0;
+
+        let ix = sell_instruction(
+            &setup.program_id,
+            &setup.global_parameters,
+            &setup.amm_account,
+            &setup.base_mint,
+            &setup.quote_mint,
+            &setup.keypair.pubkey(),
+            base_amount,
+            min_quote_amount,
+        );
+
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&setup.keypair.pubkey()));
+        tx.sign(
+            &[&setup.keypair],
+            setup.client.get_latest_blockhash().await.unwrap(),
+        );
+        setup
+            .client
+            .send_and_confirm_transaction(&tx)
+            .await
+            .unwrap();
+
+        let updated_base_reserve = fetch_reserves(&setup).await.0;
+
+        assert_ne!(
+            initial_base_reserve, updated_base_reserve,
+            "Base reserve should be updated after sell transaction"
+        );
+    }
+    #[tokio::test]
+    async fn test_sell_updates_quote_reserve_correctly() {
+        let setup = setup_test_environment(true).await;
+        let base_amount = 100_000;
+        let min_quote_amount = 1000;
+
+        let initial_quote_reserve = fetch_reserves(&setup).await.1;
+
+        let ix = sell_instruction(
+            &setup.program_id,
+            &setup.global_parameters,
+            &setup.amm_account,
+            &setup.base_mint,
+            &setup.quote_mint,
+            &setup.keypair.pubkey(),
+            base_amount,
+            min_quote_amount,
+        );
+
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&setup.keypair.pubkey()));
+        tx.sign(
+            &[&setup.keypair],
+            setup.client.get_latest_blockhash().await.unwrap(),
+        );
+        setup
+            .client
+            .send_and_confirm_transaction(&tx)
+            .await
+            .unwrap();
+
+        let updated_quote_reserve = fetch_reserves(&setup).await.1;
+
+        assert_ne!(
+            initial_quote_reserve, updated_quote_reserve,
+            "Quote reserve should be updated after sell transaction"
+        );
+    }
+    #[tokio::test]
+    async fn test_sell_updates_fee_receiver_balance_correctly() {
+        let setup = setup_test_environment(true).await;
+        let base_amount = 100_000;
+        let min_quote_amount = 1000;
+
+        let initial_fee_receiver_balance = setup
+            .client
+            .get_token_account_balance(
+                &spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &setup.keypair.pubkey(),
+                    &setup.quote_mint,
+                    &spl_token::ID,
+                ),
+            )
+            .await
+            .unwrap()
+            .amount
+            .parse::<u64>()
+            .unwrap();
+
+        let ix = sell_instruction(
+            &setup.program_id,
+            &setup.global_parameters,
+            &setup.amm_account,
+            &setup.base_mint,
+            &setup.quote_mint,
+            &setup.keypair.pubkey(),
+            base_amount,
+            min_quote_amount,
+        );
+
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&setup.keypair.pubkey()));
+        tx.sign(
+            &[&setup.keypair],
+            setup.client.get_latest_blockhash().await.unwrap(),
+        );
+        setup
+            .client
+            .send_and_confirm_transaction(&tx)
+            .await
+            .unwrap();
+
+        let updated_fee_receiver_balance = setup
+            .client
+            .get_token_account_balance(
+                &spl_associated_token_account::get_associated_token_address_with_program_id(
+                    &setup.keypair.pubkey(),
+                    &setup.quote_mint,
+                    &spl_token::ID,
+                ),
+            )
+            .await
+            .unwrap()
+            .amount
+            .parse::<u64>()
+            .unwrap();
+
+        assert_ne!(
+            initial_fee_receiver_balance, updated_fee_receiver_balance,
+            "Fee receiver's balance should be updated after sell transaction"
+        );
+    }
+}
