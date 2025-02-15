@@ -29,7 +29,7 @@ pub struct Create<'info> {
     pub amm: Account<'info, Amm>,
     #[account(seeds = [b"global_parameters"], bump)]
     pub global_parameters: Account<'info, GlobalParameters>,
-    #[account(mut)]
+    #[account(mut)] // the final buyer on pump was to be the person that pays to 'migrate' it to the new amm. no offchain withdraw authority required
     pub user: Signer<'info>,
     pub system_program: Program<'info, System>,
     #[account(init, payer=user,
@@ -43,7 +43,7 @@ pub struct Create<'info> {
     pub base_reserve_ata: AccountInfo<'info>,
     /// CHECK:
     #[account(mut)]
-    pub quote_reserve_ata: AccountInfo<'info>,
+    pub quote_reserve_ata: AccountInfo<'info>, // you'll note teh user is not the admin. there's no restrictions on the user (who signs and pays tx fees)
     #[account(token::authority = global_parameters.admin)]
     pub fee_receiver_ata: InterfaceAccount<'info, anchor_spl::token_interface::TokenAccount>,
     pub base_mint: InterfaceAccount<'info, anchor_spl::token_interface::Mint>,
